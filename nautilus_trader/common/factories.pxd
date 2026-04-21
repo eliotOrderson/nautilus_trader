@@ -287,6 +287,7 @@ cdef class OrderFactory:
         dict tp_exec_algorithm_params=*,
         list[str] tp_tags=*,
         ClientOrderId tp_client_order_id=*,
+        TriggerType tp_emulation_trigger=*,
 
         OrderType sl_order_type=*,
         Price sl_trigger_price=*,
@@ -299,4 +300,5 @@ cdef class OrderFactory:
         dict sl_exec_algorithm_params=*,
         list[str] sl_tags=*,
         ClientOrderId sl_client_order_id=*,
+        TriggerType sl_emulation_trigger=*,
     )
