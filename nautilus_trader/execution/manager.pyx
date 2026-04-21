@@ -461,8 +461,7 @@ cdef class OrderManager:
                 if self.debug:
                     self._log.info(f"Processing OCO contingent order {contingent_order}", LogColor.MAGENTA)
 
-                if not self.should_manage_order(contingent_order):
-                    continue  # Not being managed
+                # Cancel any open OCO order regardless of management status
                 if contingent_order.is_closed_c():
                     continue  # Already completed
                 if contingent_order.client_order_id != order.client_order_id:
@@ -498,14 +497,13 @@ cdef class OrderManager:
             contingent_order = self._cache.order(client_order_id)
             if contingent_order is None:
                 raise RuntimeError(f"Cannot find contingent order for {repr(client_order_id)}")  # pragma: no cover
-            if not self.should_manage_order(contingent_order):
-                continue  # Not being managed
             if client_order_id == order.client_order_id:
                 continue  # Already being handled
             if contingent_order.is_closed_c():
                 self._submit_order_commands.pop(order.client_order_id, None)
                 continue  # Already completed
 
+            # Cancel contingent orders regardless of management status
             if order.contingency_type == ContingencyType.OTO:
                 if self.debug:
                     self._log.info(f"Processing OTO child order {contingent_order}", LogColor.MAGENTA)

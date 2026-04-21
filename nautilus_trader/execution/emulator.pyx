@@ -565,6 +565,12 @@ cdef class OrderEmulator(Actor):
             self._monitored_positions.add(position_id)
 
     cpdef void _cancel_order(self, Order order):
+        cdef InstrumentId trigger_instrument_id
+        cdef MatchingCore matching_core
+        cdef CancelOrder cancel_cmd
+        cdef uint64_t ts_now
+        cdef OrderCanceled event
+
         if order is None:
             self._log.error(
                 "Cannot cancel order: order was None",
@@ -577,16 +583,35 @@ cdef class OrderEmulator(Actor):
         # Remove emulation trigger
         order.emulation_trigger = TriggerType.NO_TRIGGER
 
-        cdef InstrumentId trigger_instrument_id = order.instrument_id if order.trigger_instrument_id is None else order.trigger_instrument_id
-        cdef MatchingCore matching_core = self._matching_cores.get(trigger_instrument_id)
+        trigger_instrument_id = order.instrument_id if order.trigger_instrument_id is None else order.trigger_instrument_id
+        matching_core = self._matching_cores.get(trigger_instrument_id)
+
+        # If order is already submitted to exchange, send cancel command to ExecEngine
+        # (ExecEngine will handle the cancel flow and generate events from exchange response)
+        if order.venue_order_id is not None:
+            cancel_cmd = CancelOrder(
+                trader_id=order.trader_id,
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=order.venue_order_id,
+                command_id=UUID4(),
+                ts_init=self._clock.timestamp_ns(),
+            )
+            self._manager.send_exec_command(cancel_cmd)
+            if matching_core is not None:
+                matching_core.delete_order(order)
+            return
+
+        # Order is purely emulated (not submitted to exchange)
         if matching_core is not None:
             matching_core.delete_order(order)
 
         self.cache.update_order_pending_cancel_local(order)
 
-        # Generate event
-        cdef uint64_t ts_now = self._clock.timestamp_ns()
-        cdef OrderCanceled event = OrderCanceled(
+        # Generate local event for emulated orders only
+        ts_now = self._clock.timestamp_ns()
+        event = OrderCanceled(
             trader_id=order.trader_id,
             strategy_id=order.strategy_id,
             instrument_id=order.instrument_id,
