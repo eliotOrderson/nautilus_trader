@@ -25,7 +25,13 @@ if [[ "$EVENT_NAME" == "push" ]]; then
   if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]]; then
     run_all "New branch push: running all jobs"
   fi
-  changed_files="$(git diff --name-only "$BEFORE_SHA" HEAD)"
+  # Check if BEFORE_SHA exists in local repository (handles force-push/history rewrite)
+  if ! git rev-parse --verify "$BEFORE_SHA^{commit}" > /dev/null 2>&1; then
+    run_all "BEFORE_SHA ($BEFORE_SHA) not found (force-push/history rewrite): running all jobs"
+  fi
+  if ! changed_files="$(git diff --name-only "$BEFORE_SHA" HEAD 2> /dev/null)"; then
+    run_all "git diff failed for BEFORE_SHA ($BEFORE_SHA): running all jobs"
+  fi
 else
   # The PR event payload freezes base.sha at PR creation time, so intervening
   # commits on the base branch would otherwise appear as PR changes. Re-resolve
