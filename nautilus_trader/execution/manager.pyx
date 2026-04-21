@@ -416,6 +416,10 @@ cdef class OrderManager:
             else:
                 parent_filled_qty = order.filled_qty
 
+            # Only submit child orders when parent is fully filled
+            if not order.is_closed_c():
+                return
+
             for client_order_id in order.linked_order_ids:
                 child_order = self._cache.order(client_order_id)
                 if child_order is None:
