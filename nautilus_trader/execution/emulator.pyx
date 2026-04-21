@@ -589,6 +589,7 @@ cdef class OrderEmulator(Actor):
         # If order is already submitted to exchange, send cancel command to ExecEngine
         # (ExecEngine will handle the cancel flow and generate events from exchange response)
         if order.venue_order_id is not None:
+            self.cache.update_order_pending_cancel_local(order)
             cancel_cmd = CancelOrder(
                 trader_id=order.trader_id,
                 strategy_id=order.strategy_id,

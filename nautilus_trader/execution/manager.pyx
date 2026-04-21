@@ -416,17 +416,20 @@ cdef class OrderManager:
             else:
                 parent_filled_qty = order.filled_qty
 
-            # Only submit child orders when parent is fully filled
-            if not order.is_closed_c():
-                return
-
             for client_order_id in order.linked_order_ids:
                 child_order = self._cache.order(client_order_id)
                 if child_order is None:
                     raise RuntimeError(f"Cannot find OTO child order for {repr(client_order_id)}")  # pragma: no cover
 
-                if not self.should_manage_order(child_order):
-                    continue  # Not being managed
+                # Check if order should be managed
+                if child_order.emulation_trigger != TriggerType.NO_TRIGGER:
+                    # Emulated order: check if being managed by emulator
+                    if not self.should_manage_order(child_order):
+                        continue  # Not being managed
+                else:
+                    # Direct order (NO_TRIGGER): check if in local active state
+                    if not self.should_manage_order(child_order):
+                        continue  # Not being managed
 
                 if self.debug:
                     self._log.info(f"Processing OTO child order {child_order}", LogColor.MAGENTA)
@@ -445,6 +448,11 @@ cdef class OrderManager:
                 if self._submit_order_handler is None:
                     return  # No handler to submit
 
+                # For NO_TRIGGER orders: only submit when entry is fully filled
+                if child_order.emulation_trigger == TriggerType.NO_TRIGGER:
+                    if not order.is_closed_c():
+                        continue  # Entry not fully filled yet, don't submit direct orders
+
                 if not child_order.client_order_id in self._submit_order_commands:
                     self.create_new_submit_order(
                         order=child_order,
@@ -461,9 +469,25 @@ cdef class OrderManager:
                 if self.debug:
                     self._log.info(f"Processing OCO contingent order {contingent_order}", LogColor.MAGENTA)
 
-                # Cancel any open OCO order regardless of management status
+                # Skip if already closed or pending cancel
                 if contingent_order.is_closed_c():
                     continue  # Already completed
+                if contingent_order.is_pending_cancel_c():
+                    continue  # Already pending cancel
+
+                # Mixed emulation: handle both emulated and direct orders
+                if contingent_order.emulation_trigger != TriggerType.NO_TRIGGER:
+                    # Emulated order: check if being managed
+                    if not self.should_manage_order(contingent_order):
+                        continue  # Not being managed
+                # Direct order (NO_TRIGGER): check if already submitted to exchange
+                elif contingent_order.venue_order_id is not None:
+                    # Order is at exchange, will be cancelled via cancel_order below
+                    pass
+                else:
+                    # Direct order not yet submitted, skip
+                    continue
+
                 if contingent_order.client_order_id != order.client_order_id:
                     self.cancel_order(contingent_order)
         elif order.contingency_type == ContingencyType.OUO:
@@ -497,13 +521,14 @@ cdef class OrderManager:
             contingent_order = self._cache.order(client_order_id)
             if contingent_order is None:
                 raise RuntimeError(f"Cannot find contingent order for {repr(client_order_id)}")  # pragma: no cover
+            if not self.should_manage_order(contingent_order):
+                continue  # Not being managed
             if client_order_id == order.client_order_id:
                 continue  # Already being handled
             if contingent_order.is_closed_c():
                 self._submit_order_commands.pop(order.client_order_id, None)
                 continue  # Already completed
 
-            # Cancel contingent orders regardless of management status
             if order.contingency_type == ContingencyType.OTO:
                 if self.debug:
                     self._log.info(f"Processing OTO child order {contingent_order}", LogColor.MAGENTA)

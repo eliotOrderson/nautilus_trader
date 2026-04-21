@@ -1354,6 +1354,12 @@ cdef class OrderFactory:
         sl_tags = sl_tags if sl_tags is not None else ["STOP_LOSS"]
         tp_tags = tp_tags if tp_tags is not None else ["TAKE_PROFIT"]
 
+        # Backward compatibility: if individual emulation triggers are not set, use the global one
+        if tp_emulation_trigger == TriggerType.NO_TRIGGER and emulation_trigger != TriggerType.NO_TRIGGER:
+            tp_emulation_trigger = emulation_trigger
+        if sl_emulation_trigger == TriggerType.NO_TRIGGER and emulation_trigger != TriggerType.NO_TRIGGER:
+            sl_emulation_trigger = emulation_trigger
+
         cdef OrderListId order_list_id = self._order_list_id_generator.generate()
 
         if entry_client_order_id is None:
