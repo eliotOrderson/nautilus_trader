@@ -288,6 +288,7 @@ cdef class OrderFactory:
         list[str] tp_tags=*,
         ClientOrderId tp_client_order_id=*,
         TriggerType tp_emulation_trigger=*,
+        bint tp_reduce_only=*,
 
         OrderType sl_order_type=*,
         Price sl_trigger_price=*,
@@ -301,4 +302,5 @@ cdef class OrderFactory:
         list[str] sl_tags=*,
         ClientOrderId sl_client_order_id=*,
         TriggerType sl_emulation_trigger=*,
+        bint sl_reduce_only=*,
     )
