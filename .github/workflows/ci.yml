@@ -1,0 +1,235 @@
+name: test-build
+
+permissions: # Principle of least privilege
+  contents: read
+  actions: read
+
+on:
+  push:
+    branches: [test]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.sha }}
+  cancel-in-progress: true
+
+env:
+  # Fork PRs cannot access repo/org variables so allow lists are empty;
+  # Use audit mode for test branch to allow network access
+  EGRESS_POLICY: "audit"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      run-tests: ${{ steps.plan.outputs.run_tests }}
+      run-rust-tests: ${{ steps.plan.outputs.run_rust_tests }}
+    steps:
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: ${{ env.EGRESS_POLICY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Plan
+        id: plan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: bash scripts/ci/plan.sh
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      # https://github.com/step-security/harden-runner
+      - uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: ${{ env.EGRESS_POLICY }}
+
+      - name: Checkout repository
+        # https://github.com/actions/checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Temporary: fail fast on rare runner worktree corruption while we isolate the root cause
+      - name: Verify immutable CI inputs (post-checkout)
+        run: bash scripts/ci/verify-ci-inputs.sh post-checkout
+
+      - name: Common setup
+        uses: ./.github/actions/common-setup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          python-version: "3.13"
+          free-disk-space: "true"
+          build-type: "pre-commit"
+
+      - name: Get changed files
+        run: |
+          # Fetch upstream develop for comparison (forks don't have origin/develop)
+          git remote add upstream https://github.com/nautechsystems/nautilus_trader.git 2>/dev/null || true
+          git fetch upstream develop --depth=1
+          git diff --name-only --diff-filter=AMR -z upstream/develop..."${{ github.sha }}" > changed_files.txt
+
+          echo "Detected AMR changed files against upstream/develop:"
+          if [ -s changed_files.txt ]; then
+            tr '\0' '\n' < changed_files.txt
+          else
+            echo "(none)"
+          fi
+
+      - name: Run pre-commit
+        run: |
+          if [ -s changed_files.txt ]; then
+            echo "Running pre-commit on AMR changed files..."
+            xargs -0 prek run --files < changed_files.txt
+          else
+            echo "No AMR files changed against upstream/develop; skipping pre-commit"
+          fi
+
+      - name: Verify capnp schemas are up-to-date
+        run: make check-capnp-schemas
+
+  build-release-test:
+    if: github.ref != 'refs/heads/test-pre-commit' && needs.plan.outputs.run-tests == 'true'
+    permissions:
+      contents: write
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.12"
+          - "3.13"
+          - "3.14"
+    defaults:
+      run:
+        shell: bash
+    name: Build, Release, Test - python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    needs:
+      - plan
+      - pre-commit
+    env:
+      BUILD_MODE: release
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/build-linux-x86-py${{ matrix.python-version }}
+      RUST_BACKTRACE: 1
+    # yamllint disable rule:line-length
+    services:
+      redis:
+        image: public.ecr.aws/docker/library/redis:7.4.5-alpine3.21@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      postgres:
+        image: public.ecr.aws/docker/library/postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: pass
+          POSTGRES_DB: nautilus
+        ports:
+          - 5432:5432
+        options: --health-cmd "pg_isready -U postgres -d nautilus" --health-interval 10s --health-timeout 5s --health-retries
+          5
+    # yamllint enable rule:line-length
+    steps:
+      - uses: step-security/harden-runner@a90bcbc6539c36a85cdfeb73f7e2f433735f215b # v2.15.0
+        with:
+          egress-policy: ${{ env.EGRESS_POLICY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify immutable CI inputs (post-checkout)
+        run: bash scripts/ci/verify-ci-inputs.sh post-checkout
+
+      - name: Common setup
+        uses: ./.github/actions/common-setup
+        with:
+          python-version: ${{ matrix.python-version }}
+          free-disk-space: "true"
+          rust-cache-key: build-linux-x86-${{ matrix.python-version }}
+          rust-cache-workspaces: . -> target/build-linux-x86-py${{ matrix.python-version }}
+          rust-cache-save-if: ${{ github.event_name == 'push' }}
+
+      - name: Verify immutable CI inputs (pre-wheel build)
+        run: bash scripts/ci/verify-ci-inputs.sh pre-wheel-build
+
+      - name: Build and install wheel
+        uses: ./.github/actions/common-wheel-build
+        with:
+          python-version: ${{ matrix.python-version }}
+          github_ref: ${{ github.ref }}
+
+      - name: Create/Update Release (test branch only)
+        if: success() && github.event_name == 'push' && github.ref_name == 'test'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Ensure the continuous release exists
+          if ! gh release view continuous 2> /dev/null; then
+            gh release create continuous \
+              --title "Continuous Build (test branch)" \
+              --notes "Latest builds from test branch
+
+              **Commit:** ${{ github.sha }}
+              **Built at:** ${{ github.event.head_commit.timestamp }}" \
+              --prerelease
+          fi
+
+          # Delete old wheel(s) for this Python version only
+          # Pattern matches cp312, cp313, cp314 etc.
+          PY_TAG="cp$(echo ${{ matrix.python-version }} | tr -d '.')"
+          OLD_WHEELS=$(gh release view continuous --json assets --jq '.assets[].name' 2>/dev/null \
+            | grep -E "^[^/]+-${PY_TAG}-" || true)
+          for asset in $OLD_WHEELS; do
+            gh release delete-asset continuous "$asset" --yes 2>/dev/null || true
+          done
+
+          # Upload new wheel for this Python version
+          gh release upload continuous dist/nautilus_trader-*.whl --clobber
+
+      - name: Install Nautilus CLI
+        env:
+          NAUTILUS_CLI_FORCE_SOURCE: ${{ github.ref == 'refs/heads/nightly' && '1' || '0' }}
+        run: bash scripts/ci/install-nautilus-cli.sh
+
+      - name: Init postgres schema
+        run: nautilus database init --schema ${{ github.workspace }}/schema/sql
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_USERNAME: postgres
+          POSTGRES_PASSWORD: pass
+          POSTGRES_DATABASE: nautilus
+
+      - name: Cached test data
+        uses: ./.github/actions/common-test-data
+
+      - name: Run Rust tests (core)
+        if: needs.plan.outputs.run-rust-tests == 'true'
+        run: make cargo-test-core EXTRA_FEATURES="capnp,hypersync" NEXTEST_PROFILE=ci
+
+      - name: Run Rust tests (adapters)
+        if: needs.plan.outputs.run-rust-tests == 'true'
+        run: make cargo-test-adapters EXTRA_FEATURES="capnp,hypersync" NEXTEST_PROFILE=ci
+
+      - name: Run Python tests
+        run: |-
+          uv run --no-sync pytest --ignore=tests/performance_tests \
+            -n logical --dist=loadgroup --reruns 2 --reruns-delay 1
