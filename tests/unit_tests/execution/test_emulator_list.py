@@ -46,6 +46,7 @@ from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import OrderListId
 from nautilus_trader.model.identifiers import PositionId
+from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Money
@@ -1475,3 +1476,271 @@ class TestOrderEmulatorWithOrderLists:
         assert not matching_core.order_exists(entry_order.client_order_id)
         assert matching_core.order_exists(sl_order.client_order_id)
         assert not matching_core.order_exists(tp_order.client_order_id)
+
+    def test_mixed_emulation_oco_tp_local_sl_exchange_tp_fill_cancels_sl(self) -> None:
+        # Arrange: Mixed emulation - TP local, SL exchange
+        bracket = self.strategy.order_factory.bracket(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=ETHUSDT_PERP_BINANCE.make_qty(10),
+            sl_trigger_price=ETHUSDT_PERP_BINANCE.make_price(4900.0),
+            tp_price=ETHUSDT_PERP_BINANCE.make_price(5100.0),
+            tp_emulation_trigger=TriggerType.BID_ASK,  # TP: local emulation
+            sl_emulation_trigger=TriggerType.NO_TRIGGER,  # SL: exchange
+            contingency_type=ContingencyType.OCO,
+        )
+
+        self.strategy.submit_order_list(
+            order_list=bracket,
+            position_id=PositionId("P-001"),
+        )
+
+        # Entry submitted and filled
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(
+                bracket.first,
+                account_id=self.account_id,
+            ),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                bracket.first,
+                instrument=ETHUSDT_PERP_BINANCE,
+                account_id=self.account_id,
+            ),
+        )
+
+        sl_order = self.cache.order(bracket.orders[1].client_order_id)
+        tp_order = self.cache.order(bracket.orders[2].client_order_id)
+
+        # SL should be submitted to exchange (not emulated)
+        assert sl_order.emulation_trigger == TriggerType.NO_TRIGGER
+        assert tp_order.emulation_trigger == TriggerType.BID_ASK
+        assert tp_order.is_active_local
+
+        # Manually submit SL to exchange (simulating exchange acceptance)
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(
+                sl_order,
+                account_id=self.account_id,
+            ),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_accepted(
+                sl_order,
+                account_id=self.account_id,
+                venue_order_id=VenueOrderId("1"),
+            ),
+        )
+
+        # TP triggered and filled
+        tick = TestDataStubs.quote_tick(
+            instrument=ETHUSDT_PERP_BINANCE,
+            bid_price=5100.0,
+            ask_price=5100.0,
+        )
+        self.data_engine.process(tick)
+
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(
+                tp_order,
+                account_id=self.account_id,
+            ),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                tp_order,
+                instrument=ETHUSDT_PERP_BINANCE,
+                account_id=self.account_id,
+                venue_order_id=VenueOrderId("2"),
+            ),
+        )
+
+        # Simulate exchange cancel response for SL
+        self.exec_engine.process(
+            TestEventStubs.order_canceled(
+                sl_order,
+                account_id=self.account_id,
+            ),
+        )
+
+        # Assert: TP filled, SL should be canceled
+        matching_core = self.emulator.get_matching_core(ETHUSDT_PERP_BINANCE.id)
+        entry_order = self.cache.order(bracket.first.client_order_id)
+        sl_order = self.cache.order(bracket.orders[1].client_order_id)
+        tp_order = self.cache.order(bracket.orders[2].client_order_id)
+
+        assert entry_order.status == OrderStatus.FILLED
+        assert tp_order.status == OrderStatus.FILLED
+        assert sl_order.status == OrderStatus.CANCELED
+        assert not matching_core.order_exists(tp_order.client_order_id)
+
+    def test_mixed_emulation_entry_partial_fill_should_not_submit_sl_to_exchange(self) -> None:
+        # Arrange: Mixed emulation - entry with partial fills, SL should wait for full fill
+        bracket = self.strategy.order_factory.bracket(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=ETHUSDT_PERP_BINANCE.make_qty(10),
+            sl_trigger_price=ETHUSDT_PERP_BINANCE.make_price(4900.0),
+            tp_price=ETHUSDT_PERP_BINANCE.make_price(5100.0),
+            tp_emulation_trigger=TriggerType.BID_ASK,  # TP: local emulation
+            sl_emulation_trigger=TriggerType.NO_TRIGGER,  # SL: exchange
+            contingency_type=ContingencyType.OCO,
+        )
+
+        self.strategy.submit_order_list(
+            order_list=bracket,
+            position_id=PositionId("P-001"),
+        )
+
+        sl_order = self.cache.order(bracket.orders[1].client_order_id)
+        tp_order = self.cache.order(bracket.orders[2].client_order_id)
+
+        # Entry submitted
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(
+                bracket.first,
+                account_id=self.account_id,
+            ),
+        )
+
+        # Act: Entry partial fill (3 out of 10)
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                bracket.first,
+                instrument=ETHUSDT_PERP_BINANCE,
+                account_id=self.account_id,
+                last_qty=Quantity.from_int(3),  # Partial fill
+                trade_id=TradeId("T-001"),  # Unique trade ID for first fill
+            ),
+        )
+
+        # Assert: SL should NOT be submitted on partial fill
+        assert bracket.first.status == OrderStatus.PARTIALLY_FILLED
+        assert sl_order.status == OrderStatus.INITIALIZED
+        assert sl_order.venue_order_id is None  # Not submitted to exchange
+        assert tp_order.status == OrderStatus.EMULATED  # TP is emulated
+        assert tp_order.quantity == Quantity.from_int(3)  # TP qty updated to match filled
+
+        # Act: Another partial fill (5 more, total 8 out of 10)
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                bracket.first,
+                instrument=ETHUSDT_PERP_BINANCE,
+                account_id=self.account_id,
+                last_qty=Quantity.from_int(5),
+                trade_id=TradeId("T-002"),  # Unique trade ID for second fill
+            ),
+        )
+
+        # Assert: SL still should NOT be submitted
+        assert bracket.first.status == OrderStatus.PARTIALLY_FILLED
+        assert sl_order.status == OrderStatus.INITIALIZED
+        assert sl_order.venue_order_id is None
+        assert tp_order.quantity == Quantity.from_int(8)  # TP qty updated to match filled
+
+        # Act: Final fill (remaining 2, total 10)
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                bracket.first,
+                instrument=ETHUSDT_PERP_BINANCE,
+                account_id=self.account_id,
+                last_qty=Quantity.from_int(2),
+            ),
+        )
+
+        # Assert: Entry now fully filled, SL should be ready to submit
+        assert bracket.first.status == OrderStatus.FILLED
+        # SL command should now be created (ready for submission)
+        submit_commands = self.emulator.get_submit_order_commands()
+        assert sl_order.client_order_id in submit_commands
+        assert sl_order.quantity == Quantity.from_int(10)
+        assert tp_order.quantity == Quantity.from_int(10)
+
+    def test_mixed_emulation_oco_tp_fill_marks_sl_as_pending_cancel(self) -> None:
+        # Arrange: Mixed emulation OCO - TP locally emulated, SL at exchange
+        bracket = self.strategy.order_factory.bracket(
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.BUY,
+            quantity=ETHUSDT_PERP_BINANCE.make_qty(10),
+            sl_trigger_price=ETHUSDT_PERP_BINANCE.make_price(4900.0),
+            tp_price=ETHUSDT_PERP_BINANCE.make_price(5100.0),
+            tp_emulation_trigger=TriggerType.BID_ASK,
+            sl_emulation_trigger=TriggerType.NO_TRIGGER,
+            contingency_type=ContingencyType.OCO,
+        )
+
+        self.strategy.submit_order_list(
+            order_list=bracket,
+            position_id=PositionId("P-001"),
+        )
+
+        sl_order = self.cache.order(bracket.orders[1].client_order_id)
+        tp_order = self.cache.order(bracket.orders[2].client_order_id)
+
+        # Entry filled
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(
+                bracket.first,
+                account_id=self.account_id,
+            ),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                bracket.first,
+                instrument=ETHUSDT_PERP_BINANCE,
+                account_id=self.account_id,
+            ),
+        )
+
+        # SL submitted to exchange
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(
+                sl_order,
+                account_id=self.account_id,
+            ),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_accepted(
+                sl_order,
+                account_id=self.account_id,
+                venue_order_id=VenueOrderId("V-SL-001"),
+            ),
+        )
+
+        # TP triggered
+        tick = TestDataStubs.quote_tick(
+            instrument=ETHUSDT_PERP_BINANCE,
+            bid_price=5101.0,
+            ask_price=5101.0,
+        )
+        self.data_engine.process(tick)
+
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(
+                tp_order,
+                account_id=self.account_id,
+            ),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_accepted(
+                tp_order,
+                account_id=self.account_id,
+                venue_order_id=VenueOrderId("V-TP-001"),
+            ),
+        )
+
+        # Act: TP filled - triggers OCO to cancel SL
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                tp_order,
+                instrument=ETHUSDT_PERP_BINANCE,
+                account_id=self.account_id,
+                venue_order_id=VenueOrderId("V-TP-001"),
+            ),
+        )
+
+        # Assert: SL should be marked as pending cancel (cache tracks this)
+        # This is the key fix: emulator calls cache.update_order_pending_cancel_local()
+        # for exchange orders, allowing cancel_order() to skip duplicates
+        assert self.cache.is_order_pending_cancel_local(sl_order.client_order_id)

@@ -441,6 +441,13 @@ cdef class OrderManager:
                 if self._submit_order_handler is None:
                     return  # No handler to submit
 
+                # For local hybrid simulation OTO, be like: sl(exchange)/tp(local)
+                # - sl(exchange) order need to wait until all entry orders qty are filled
+                # - tp(local) order will automatic fix qty in qty partial filled
+                if child_order.emulation_trigger == TriggerType.NO_TRIGGER:
+                    if not order.is_closed_c():
+                        continue  # Entry not fully filled yet, don't submit direct orders
+
                 if not child_order.client_order_id in self._submit_order_commands:
                     self.create_new_submit_order(
                         order=child_order,
@@ -457,10 +464,17 @@ cdef class OrderManager:
                 if self.debug:
                     self._log.info(f"Processing OCO contingent order {contingent_order}", LogColor.MAGENTA)
 
-                if not self.should_manage_order(contingent_order):
-                    continue  # Not being managed
-                if contingent_order.is_closed_c():
+                # Skip if already closed or pending cancel
+                if contingent_order.is_closed_c() or contingent_order.is_pending_cancel_c():
                     continue  # Already completed
+
+                # Be like: sl(exchange)/tp(local): check if already submitted to exchange
+                if contingent_order.venue_order_id is not None:
+                    # Order is at exchange, will be cancelled via cancel_order below
+                    pass
+                elif not self.should_manage_order(contingent_order):
+                    continue  # Not being managed
+
                 if contingent_order.client_order_id != order.client_order_id:
                     self.cancel_order(contingent_order)
         elif order.contingency_type == ContingencyType.OUO:
